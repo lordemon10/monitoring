@@ -1,0 +1,252 @@
+# Переменные для подключения БД
+$MyServer = "127.0.0.1"
+$MyPort = "5432"
+$MyDB = "test_db"
+$MyUid = "bro"
+$MyPass = "1"
+
+# SQL запрос
+$query = "SELECT table_name, current_timestamp FROM aradmin WHERE msg = 'error';"
+# Файл для хранения старых данных
+$oldTableFile = "C:\Users\user\Documents\project\powershell\monitoring\old_table.csv"
+# Файл для хранения новых данных
+$newErrorFile = "C:\Users\user\Documents\project\powershell\monitoring\new_error.csv"
+# Файл для логов
+$logFile = "C:\Users\user\Documents\project\powershell\monitoring\log.txt"
+$errorCounter = 0
+
+# Переменные для Telegram
+$telegramBotToken = "7679335263:AAHgVwkTZgFZlkoJmEWaAW6nYJ2ikV61tTI"
+$telegramChatId = "518621583"
+
+# Перемнные для SMTP сервера
+$smtpServer = "main.rgs.ru"  # Замените на ваш SMTP сервер
+$smtpPort = 25                    # Обычно это 587
+$username = "your-email@example.com" # Ваш логин для SMTP
+$password = "your-password"         # Ваш пароль для SMTP
+$from = "vladimir_barykov@rgs.ru"    # Адрес отправителя
+$to = @("vladimir_barykov@rgs.ru") # Получатели
+$subject = "ТЕСТ"
+
+# Функция для отправки сообщения в Telegram
+function Send-TelegramMessage($message) {
+    $url = "https://api.telegram.org/bot$telegramBotToken/sendMessage"
+    $body = @{
+        chat_id = $telegramChatId
+        text    = $message
+    }
+    
+    try {
+    Invoke-RestMethod -Uri $url -Method Post -Body $body
+    Log-Message "Сообщение в телеграмм бот отправлено успешно. Текст сообщения: $messageBody"
+    } catch {
+    Log-Message "Сообщение в телеграмм бот не отправлено. Ошибка: $_ `n Текст сообщения: $messageBody" -Level "ERROR"
+    }
+}
+
+function Send-SmtpEmail {
+    param (
+        [string]$smtpServer,          # SMTP сервер
+        [int]$smtpPort = 587,         # Порт (по умолчанию 587)
+        [string]$username,            # Имя пользователя
+        [string]$password,            # Пароль
+        [string]$from,                # Адрес отправителя
+        [string[]]$to,                # Адреса получателей
+        [string]$subject,             # Тема письма
+        [string]$body,                # Текст письма
+        [int]$retryInterval = 60,     # Интервал повторной попытки (по умолчанию 1 час)
+        [int]$maxRetries = 5          # Максимальное количество попыток
+    )
+    
+    # Создаём объект для учётных данных
+    #$securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+    #$credential = New-Object System.Management.Automation.PSCredential($username, $securePassword)
+
+    # Формируем сообщение
+    $message = New-Object System.Net.Mail.MailMessage
+    $message.From = $from
+    $message.Subject = $subject
+    $message.Body = $body
+    $message.IsBodyHtml = $false   # Установите true, если тело письма в формате HTML
+
+    # Добавляем получателей
+    foreach ($recipient in $to) {
+        $message.To.Add($recipient)
+    }
+
+    # Создаём объект SMTP-клиента
+    $smtpClient = New-Object Net.Mail.SmtpClient($smtpServer, $smtpPort)
+    $smtpClient.EnableSsl = $true                  # Включить SSL, если требуется
+    #$smtpClient.Credentials = $credential          # Добавляем учётные данные
+
+    # Переменная для отслеживания успешной отправки
+    $attempt = 0
+    $isSent = $false
+
+    while (-not $isSent -and $attempt -lt $maxRetries) {
+        try {
+            # Отправляем письмо
+            $smtpClient.Send($message)
+            Log-Message "Сообщение на smtp сервер успешно отправлено."
+            $isSent = $true  # Устанавливаем флаг успешной отправки
+        } catch {
+            $attempt++
+            Log-Message "Ошибка при отправке сообщения: $_. Попробую снова через $retryInterval секунд." -Level "WARN"
+            Start-Sleep -Seconds $retryInterval  # Ждём перед следующей попыткой
+        }
+    }
+
+    if (-not $isSent) {
+        Log-Message "Не удалось отправить сообщение после $maxRetries попыток." -Level "ERROR"
+    }
+}
+
+# Функция для выполнения SQL запроса на БД
+function PosgreDB-Query($statement) {
+    $DBConnectionString = "Driver={PostgreSQL UNICODE(x64)};Server=$MyServer;Port=$MyPort;Database=$MyDB;Uid=$MyUid;Pwd=$MyPass;"
+    $DBConn = New-Object System.Data.Odbc.OdbcConnection
+    try {
+        $DBConn.ConnectionString = $DBConnectionString
+        $DBConn.Open()
+        Log-Message "Подключение к БД успешно."
+        
+        $stmt = New-Object System.Data.Odbc.OdbcCommand($statement, $DBConn)
+        $result = New-Object System.Data.DataSet
+        
+        try {
+            (New-Object System.Data.Odbc.OdbcDataAdapter($stmt)).fill($result) | Out-Null
+            Log-Message "SQL запрос выполнен успешно."
+            return $result
+        } catch {
+            Log-Message "Ошибка при выполнении SQL запроса: $_" -Level "ERROR"
+            $errorCounter++ # Увеличение счетчика ошибок
+            return $null
+        }
+
+    } catch {
+        Log-Message "Не удалось подключиться к БД: $_" -Level "ERROR"
+        $errorCounter++ # Увеличение счетчика ошибок
+        return $null
+    } finally {
+        # Вызываем функцию закрытия соединения
+        Close-DBConnection $DBConn
+    }
+}
+
+# Функция для закрытия соединения с БД
+function Close-DBConnection($DBConn) {
+    $attempts = 0
+    while ($DBConn.State -eq 'Open' -and $attempts -lt 5) {
+        try {
+            $DBConn.Close()
+            Log-Message "Подключение к БД закрыто."
+        } catch {
+            Log-Message "Ошибка при закрытии соединения: $_" -Level "WARN"
+	    Start-Sleep -Seconds 5
+        }
+        $attempts++
+    }
+    if ($DBConn.State -ne 'Closed') {
+        Log-Message "Не удалось закрыть подключение к БД после нескольких попыток." -Level "ERROR"
+        $errorCounter++
+    }
+}
+
+# Логирование действия
+function Log-Message($message, $level = "INFO") {
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    Add-Content -Path $logFile -Value "[$level] $timestamp - $message"
+}
+
+# Проверка, существует ли файл old_table.csv
+if (!(Test-Path $oldTableFile)) {
+    New-Item -Path $oldTableFile -ItemType File -Force | Out-Null
+    Log-Message "Создан новый файл для хранения старых таблиц: $oldTableFile"
+}
+
+# Чтение старых таблиц из файла
+$oldTables = Import-Csv -Path $oldTableFile
+
+# Вызов функции с необходимым sql запросом
+$dataset = PosgreDB-Query $query
+
+# Формирование итогового сообщения для Telegram
+$messageBody = "Результаты мониторинга на " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + ":`n"
+
+# Проверяем, если запрос вернул результат
+if ($dataset -eq $null) {
+    Log-Message "Запрос не выполнен, завершение работы."
+    $messageBody += "`nОшибка при выполнении мониторинга.."
+    try {
+            Send-TelegramMessage $messageBody
+            Log-Message "Сообщение в телеграмм бот отправлено успешно."
+    } catch {
+            Log-Message "Сообщение в телеграмм бот не отправлено. Ошибка: $_ `n Текст сообщения: $messageBody" -Level "ERROR"
+    }
+    exit
+}
+
+# Создание списка новых ошибок
+$newErrors = @()
+$remainingErrors = @()
+
+foreach ($row in $dataset.Tables[0]) {
+    $tableName = $row.table_name
+    $currentTimestamp = $row.current_timestamp
+
+    # Проверка на наличие в старых таблицах
+    $exists = $oldTables | Where-Object { $_.table_name -eq $tableName }
+    $remainingErrors += [PSCustomObject]@{
+        table_name = $tableName
+        current_timestamp = $currentTimestamp
+    }
+    # Если таблица новая, добавляем её в список новых ошибок
+    if (-not $exists) {
+        $newErrors += [PSCustomObject]@{
+            table_name = $tableName
+            current_timestamp = $currentTimestamp
+        }
+    }
+}
+
+# Если есть новые ошибки, обновляем файлы и добавляем в сообщение
+if ($newErrors.Count -gt 0) {
+    # Сохраняем новые ошибки в новый файл
+    $newErrors | Export-Csv -Path $newErrorFile -NoTypeInformation
+    $messageBody += "`nОбнаружены новые таблицы со статусом ERROR:`n"
+    foreach ($new in $newErrors) {
+        $messageBody += "Таблица: $($new.table_name) в $($new.current_timestamp)`n"
+    }
+} 
+
+# Логируем отсутствующие таблицы
+if ($missingErrors.Count -gt 0) {
+    $missingMessage = "Таблицы, которые больше не находятся в статусе ERROR: "
+    foreach ($missing in $missingErrors) {
+        $missingMessage += "$($missing.table_name), "
+    }
+    $missingMessage = $missingMessage.Remove($missingMessage.Length - 2)
+    Log-Message $missingMessage
+}
+
+# Обновляем old_table.csv, убирая таблицы, которые больше не в статусе error
+$activeErrors = $dataset.Tables[0] | ForEach-Object { $_.table_name }
+
+# Определяем таблицы, которые были в старом файле, но теперь отсутствуют
+$missingErrors = $oldTables | Where-Object { $activeErrors -notcontains $_.table_name }
+
+# Сохраняем только актуальные ошибки в old_table.csv
+try {
+    $remainingErrors | Export-Csv -Path $oldTableFile -NoTypeInformation
+    Log-Message "Файл old_table.csv обновлен. Актуальные ошибки записаны."
+} catch {
+    Log-Message "Обновить файл old_table.csv не удалось. Ошибка: $_" -Level "ERROR"
+    $errorCounter++
+}
+
+# Отправка итогового сообщения в Телеграмм и на Почту
+if (($errorCounter -eq 0) -and ($newErrors.Count -gt 0)){
+
+    Send-TelegramMessage $messageBody
+    Send-SmtpEmail -smtpServer $smtpServer -smtpPort $smtpPort -from $from -to $to -subject $subject -body $messageBody #-username $username -password $password
+}
